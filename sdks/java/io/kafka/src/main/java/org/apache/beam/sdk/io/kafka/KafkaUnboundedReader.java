@@ -19,6 +19,7 @@ package org.apache.beam.sdk.io.kafka;
 
 import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkState;
 
+import java.lang.Runnable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -26,8 +27,11 @@ import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.HashMap;
 import java.util.NoSuchElementException;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -123,6 +127,14 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
     // Start consumer read loop.
     // Note that consumer is not thread safe, should not be accessed out side consumerPollLoop().
     consumerPollThread.submit(this::consumerPollLoop);
+    if (!logThreadRunning) {
+      synchronized (logThreadLock) {
+        if (!logThreadRunning) {
+          logThread.submit(statLogger);
+          logThreadRunning = true;
+        }
+      }
+    }
 
     // offsetConsumer setup :
     Map<String, Object> offsetConsumerConfig =
@@ -339,6 +351,13 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
   // like 100 milliseconds does not work well. This along with large receive buffer for
   // consumer achieved best throughput in tests (see `defaultConsumerProperties`).
   private final ExecutorService consumerPollThread = Executors.newSingleThreadExecutor();
+
+  private final static ExecutorService logThread = Executors.newSingleThreadExecutor();
+  private final static StatisticsLogger statLogger = new StatisticsLogger(60);
+  // only one thread should be created per worker, not per reader.
+  private static Object logThreadLock = new Object();
+  private static boolean logThreadRunning = false;
+
   private AtomicReference<Exception> consumerPollException = new AtomicReference<>();
   private final SynchronousQueue<ConsumerRecords<byte[], byte[]>> availableRecordsQueue =
       new SynchronousQueue<>();
@@ -423,11 +442,15 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
     synchronized void setLatestOffset(long latestOffset, Instant fetchTime) {
       this.latestOffset = latestOffset;
       this.latestOffsetFetchTime = fetchTime;
+      if (!statLogger.add(new LatestOffsetEvent(this.topicPartition, latestOffset, nextOffset, avgRecordSize.get()))) {
+        LOG.error("Periodical log Failed to add latest offset event");
+      }
       LOG.debug(
-          "{}: latest offset update for {} : {} (consumer offset {}, avg record size {})",
+          "{}: latest offset update for {} : {} (consumer offset {}, lag {}, avg record size {})",
           this,
           topicPartition,
           latestOffset,
+          latestOffset - nextOffset,
           nextOffset,
           avgRecordSize);
     }
@@ -517,10 +540,28 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
 
     try {
       ConsumerRecords<byte[], byte[]> records = ConsumerRecords.empty();
+      Map<TopicPartition, Long> polledCount = new HashMap<>();
+      java.time.Instant updateTime = java.time.Instant.now();
       while (!closed.get()) {
         try {
           if (records.isEmpty()) {
             records = consumer.poll(KAFKA_POLL_TIMEOUT.getMillis());
+
+            for (TopicPartition p : records.partitions()) {
+              int count = records.records(p).size();
+              polledCount.put(p, count + polledCount.getOrDefault(p, 0L));
+            }
+            if (java.time.Instant.now().isAfter(updateTime.plusSeconds(10))) {
+              for (TopicPartition p : polledCount.keySet()) {
+                if (!statLogger.add(new MessagePollEvent(p, polledCount.get(p)))) {
+                  LOG.error("Periodical log Failed to add poll event");
+                } else {
+                  polledCount.put(p, 0L);
+                }
+              }
+              updateTime = java.time.Instant.now();
+            }
+
           } else if (availableRecordsQueue.offer(
               records, RECORDS_ENQUEUE_POLL_TIMEOUT.getMillis(), TimeUnit.MILLISECONDS)) {
             records = ConsumerRecords.empty();
@@ -642,7 +683,11 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
       }
     }
 
-    LOG.debug("{}:  backlog {}", this, getSplitBacklogBytes());
+    LOG.debug(
+        "{}:  backlog bytes {}, and backlog message count {}",
+        this,
+        getSplitBacklogBytes(),
+        getSplitBacklogMessageCount());
   }
 
   private void reportBacklog() {
@@ -743,4 +788,130 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
         ? Duration.millis((Integer) value)
         : Duration.millis(Integer.parseInt(value.toString()));
   }
+
+  private static class LogInfo {
+    long latestOffset = 0;
+    long nextOffset = 0;
+    double averageSize = 0;
+    long totalPollCount = 0;
+    LogInfo() {}
+    void copy(LogInfo info) {
+      this.latestOffset = info.latestOffset;
+      this.nextOffset = info.nextOffset;
+      this.averageSize = info.averageSize;
+      this.totalPollCount = info.totalPollCount;
+    }
+  }
+  private static class StatisticsLogger implements Runnable {
+    ConcurrentLinkedQueue<Event> queue;
+    java.time.Instant lastLogTime;
+    final int intervalSeconds;
+
+    Map<TopicPartition, LogInfo> logInfos;
+    Map<TopicPartition, LogInfo> lastLoggedInfos;
+
+    StatisticsLogger(int intervalSeconds) {
+      queue = new ConcurrentLinkedQueue<Event>();
+      lastLogTime = java.time.Instant.now();
+      this.intervalSeconds = intervalSeconds;
+      logInfos = new HashMap<>();
+      lastLoggedInfos = new HashMap<>();
+    }
+    boolean add(Event e) {
+      return queue.offer(e);
+    }
+    void processEvent(Event e) {
+      if (!logInfos.containsKey(e.tp)) {
+        logInfos.put(e.tp, new LogInfo());
+        lastLoggedInfos.put(e.tp, new LogInfo());
+      }
+      LogInfo info = logInfos.get(e.tp);
+      if (e instanceof LatestOffsetEvent) {
+        LatestOffsetEvent event = (LatestOffsetEvent) e;
+        info.latestOffset = event.latestOffset;
+        info.nextOffset = event.nextOffset;
+        info.averageSize = event.averageSize;
+      } else if (e instanceof MessagePollEvent) {
+        MessagePollEvent event = (MessagePollEvent) e;
+        info.totalPollCount += event.pollCount;
+      } else {
+
+      }
+    }
+    @Override
+    public void run() {
+      try {
+        while (true) {
+          if (queue.size() > 0) {
+            int size = queue.size();
+            while (size-- > 0) {
+              Event e = queue.poll();
+              processEvent(e);
+            }
+          }
+          logIfNecessary();
+
+          try {
+            Thread.sleep(2000);
+          } catch (InterruptedException e) {
+            LOG.error("StatLogger thread interrupted during sleep.", e);
+          }
+        }
+      } catch (Exception e) {
+        LOG.error("StatLogger encountered error", e);
+      }
+    }
+    void logIfNecessary() {
+      if (!java.time.Instant.now().isAfter(lastLogTime.plusSeconds(intervalSeconds))) return;
+      StringBuilder sb = new StringBuilder();
+      sb.append("Periodical log: {");
+      for (TopicPartition p : logInfos.keySet()) {
+        LogInfo info = logInfos.get(p);
+        sb.append("{").append(p).append(
+          String.format(": lag %d (latest %d next %d avgSize %d total polled %d)",
+            info.latestOffset - info.nextOffset,
+            info.latestOffset, info.nextOffset, (long)info.averageSize, info.totalPollCount));
+        if (lastLoggedInfos.get(p) != null) {
+          LogInfo lastInfo = lastLoggedInfos.get(p);
+          sb.append(String.format(", lag increased %d (latest %d next %d message polled %d)",
+            (info.latestOffset - lastInfo.latestOffset) - (info.nextOffset - lastInfo.nextOffset),
+            info.latestOffset - lastInfo.latestOffset, info.nextOffset - lastInfo.nextOffset,
+            info.totalPollCount - lastInfo.totalPollCount));
+        } else {
+          lastLoggedInfos.put(p, new LogInfo());
+        }
+        lastLoggedInfos.get(p).copy(info);
+        sb.append("} ");
+      }
+      sb.append("}");
+      LOG.info(sb.toString());
+      lastLogTime = java.time.Instant.now();
+    }
+
+  }
+  private static abstract class Event {
+    TopicPartition tp;
+    Event(TopicPartition tp) { this.tp = tp; }
+  }
+  private static class LatestOffsetEvent extends Event {
+    long latestOffset;
+    long nextOffset;
+    double averageSize;
+    LatestOffsetEvent(TopicPartition tp, long latestOffset, long nextOffset, double averageSize) {
+      super(tp);
+      this.latestOffset = latestOffset;
+      this.nextOffset = nextOffset;
+      this.averageSize = averageSize;
+    }
+  }
+  private static class MessagePollEvent extends Event {
+    long pollCount;
+    MessagePollEvent(TopicPartition tp, long pollCount) {
+      super(tp);
+      this.pollCount = pollCount;
+    }
+  }
+  // private static class CommitOffsetEvent extends Event {
+
+  // }
 }
