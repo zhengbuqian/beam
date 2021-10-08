@@ -442,7 +442,7 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
     synchronized void setLatestOffset(long latestOffset, Instant fetchTime) {
       this.latestOffset = latestOffset;
       this.latestOffsetFetchTime = fetchTime;
-      if (!statLogger.add(new LatestOffsetEvent(this.topicPartition, latestOffset, nextOffset, avgRecordSize.get()))) {
+      if (!statLogger.add(new LatestOffsetTPEvent(this.topicPartition, latestOffset, nextOffset, avgRecordSize.get()))) {
         LOG.error("Periodical log Failed to add latest offset event");
       }
       LOG.debug(
@@ -545,7 +545,10 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
       while (!closed.get()) {
         try {
           if (records.isEmpty()) {
+            Instant pollStart = Instant.now();
             records = consumer.poll(KAFKA_POLL_TIMEOUT.getMillis());
+            Duration d = new Duration(pollStart, Instant.now());
+            statLogger.add(new PollEvent(true, !records.isEmpty(), d));
 
             for (TopicPartition p : records.partitions()) {
               int count = records.records(p).size();
@@ -553,7 +556,7 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
             }
             if (java.time.Instant.now().isAfter(updateTime.plusSeconds(10))) {
               for (TopicPartition p : polledCount.keySet()) {
-                if (!statLogger.add(new MessagePollEvent(p, polledCount.get(p)))) {
+                if (!statLogger.add(new ConsumerPollTPEvent(p, polledCount.get(p)))) {
                   LOG.error("Periodical log Failed to add poll event");
                 } else {
                   polledCount.put(p, 0L);
@@ -562,13 +565,22 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
               updateTime = java.time.Instant.now();
             }
 
-          } else if (availableRecordsQueue.offer(
-              records, RECORDS_ENQUEUE_POLL_TIMEOUT.getMillis(), TimeUnit.MILLISECONDS)) {
-            records = ConsumerRecords.empty();
+          } else {
+            Instant offerStart = Instant.now();
+            boolean offerOk = availableRecordsQueue.offer(
+              records, RECORDS_ENQUEUE_POLL_TIMEOUT.getMillis(), TimeUnit.MILLISECONDS);
+            Duration d = new Duration(offerStart, Instant.now());
+            statLogger.add(new PollEvent(false, offerOk, d));
+            if (offerOk) {
+              records = ConsumerRecords.empty();
+            }
           }
           KafkaCheckpointMark checkpointMark = finalizedCheckpointMark.getAndSet(null);
           if (checkpointMark != null) {
+            Instant commitStart = Instant.now();
             commitCheckpointMark(checkpointMark);
+            Duration d = new Duration(commitStart, Instant.now());
+            statLogger.add(new CommitOffsetEvent(d));
           }
         } catch (InterruptedException e) {
           LOG.warn("{}: consumer thread is interrupted", this, e); // not expected
@@ -802,6 +814,25 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
       this.totalPollCount = info.totalPollCount;
     }
   }
+  private static class ConsumerPollStat {
+    int pollTimes = 0;
+    int offerTimes = 0;
+    int commitTimes = 0;
+    Duration total = Duration.ZERO;
+    Duration pollUseful = Duration.ZERO;
+    Duration pollWasted = Duration.ZERO;
+    Duration offerUseful = Duration.ZERO;
+    Duration offerWasted = Duration.ZERO;
+    Duration commitOffset = Duration.ZERO;
+    ConsumerPollStat() {}
+    @Override
+    public String toString() {
+      return String.format("poll %d, useful %s, wasted %s; offer %d useful %s, wasted %s; checkpoint %d times %s; total %s",
+        pollTimes, pollUseful, pollWasted,
+        offerTimes, offerUseful, offerWasted,
+        commitTimes, commitOffset, total);
+    }
+  }
   private static class StatisticsLogger implements Runnable {
     ConcurrentLinkedQueue<Event> queue;
     java.time.Instant lastLogTime;
@@ -809,6 +840,7 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
 
     Map<TopicPartition, LogInfo> logInfos;
     Map<TopicPartition, LogInfo> lastLoggedInfos;
+    ConsumerPollStat consumerPollStat;
 
     StatisticsLogger(int intervalSeconds) {
       queue = new ConcurrentLinkedQueue<Event>();
@@ -816,23 +848,53 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
       this.intervalSeconds = intervalSeconds;
       logInfos = new HashMap<>();
       lastLoggedInfos = new HashMap<>();
+      consumerPollStat = new ConsumerPollStat();
     }
     boolean add(Event e) {
       return queue.offer(e);
     }
     void processEvent(Event e) {
+      if (e instanceof TPEvent) {
+        processTPEvent((TPEvent)e);
+        return;
+      } else if (e instanceof PollEvent) {
+        PollEvent event = (PollEvent) e;
+        consumerPollStat.total = consumerPollStat.total.plus(event.duration);
+        if (event.isPoll) {
+          consumerPollStat.pollTimes++;
+          if (event.useful) {
+            consumerPollStat.pollUseful = consumerPollStat.pollUseful.plus(event.duration);
+          } else {
+            consumerPollStat.pollWasted = consumerPollStat.pollWasted.plus(event.duration);
+          }
+        } else {
+          consumerPollStat.offerTimes++;
+          if (event.useful) {
+            consumerPollStat.offerUseful = consumerPollStat.offerUseful.plus(event.duration);
+          } else {
+            consumerPollStat.offerWasted = consumerPollStat.offerWasted.plus(event.duration);
+          }
+        }
+      } else if (e instanceof CommitOffsetEvent) {
+        CommitOffsetEvent event = (CommitOffsetEvent) e;
+        consumerPollStat.total = consumerPollStat.total.plus(event.duration);
+        consumerPollStat.commitTimes++;
+        consumerPollStat.commitOffset = consumerPollStat.commitOffset.plus(event.duration);
+      }
+    }
+    void processTPEvent(TPEvent e) {
       if (!logInfos.containsKey(e.tp)) {
         logInfos.put(e.tp, new LogInfo());
         lastLoggedInfos.put(e.tp, new LogInfo());
       }
       LogInfo info = logInfos.get(e.tp);
-      if (e instanceof LatestOffsetEvent) {
-        LatestOffsetEvent event = (LatestOffsetEvent) e;
+      if (e instanceof LatestOffsetTPEvent) {
+        LatestOffsetTPEvent event = (LatestOffsetTPEvent) e;
         info.latestOffset = event.latestOffset;
         info.nextOffset = event.nextOffset;
         info.averageSize = event.averageSize;
-      } else if (e instanceof MessagePollEvent) {
-        MessagePollEvent event = (MessagePollEvent) e;
+      } else if (e instanceof ConsumerPollTPEvent) {
+        ConsumerPollTPEvent event = (ConsumerPollTPEvent) e;
         info.totalPollCount += event.pollCount;
       } else {
 
@@ -881,37 +943,59 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
           lastLoggedInfos.put(p, new LogInfo());
         }
         lastLoggedInfos.get(p).copy(info);
-        sb.append("} ");
+        sb.append("}\n");
       }
-      sb.append("}");
+      sb.deleteCharAt(sb.length() - 1).append("}\n");
+
+      sb.append("Timing stats: ");
+      sb.append(consumerPollStat);
+
       LOG.info(sb.toString());
       lastLogTime = java.time.Instant.now();
     }
 
   }
-  private static abstract class Event {
+  private static abstract class Event {}
+  // per topic partition events
+  private static abstract class TPEvent extends Event {
     TopicPartition tp;
-    Event(TopicPartition tp) { this.tp = tp; }
+    TPEvent(TopicPartition tp) { this.tp = tp; }
   }
-  private static class LatestOffsetEvent extends Event {
+  private static class LatestOffsetTPEvent extends TPEvent {
     long latestOffset;
     long nextOffset;
     double averageSize;
-    LatestOffsetEvent(TopicPartition tp, long latestOffset, long nextOffset, double averageSize) {
+    LatestOffsetTPEvent(TopicPartition tp, long latestOffset, long nextOffset, double averageSize) {
       super(tp);
       this.latestOffset = latestOffset;
       this.nextOffset = nextOffset;
       this.averageSize = averageSize;
     }
   }
-  private static class MessagePollEvent extends Event {
+  private static class ConsumerPollTPEvent extends TPEvent {
+    // number of message polled in tp
     long pollCount;
-    MessagePollEvent(TopicPartition tp, long pollCount) {
+    ConsumerPollTPEvent(TopicPartition tp, long pollCount) {
       super(tp);
       this.pollCount = pollCount;
     }
   }
-  // private static class CommitOffsetEvent extends Event {
 
-  // }
+  private static class PollEvent extends Event {
+    Duration duration;
+    // true if poll, false if offer
+    boolean isPoll;
+    boolean useful;
+    PollEvent(boolean isPoll, boolean useful, Duration duration) {
+      this.isPoll = isPoll;
+      this.useful = useful;
+      this.duration = duration;
+    }
+  }
+  private static class CommitOffsetEvent extends Event {
+    Duration duration;
+    CommitOffsetEvent(Duration duration) {
+      this.duration = duration;
+    }
+  }
 }
