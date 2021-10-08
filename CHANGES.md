@@ -49,7 +49,7 @@
 
 * ([BEAM-X](https://issues.apache.org/jira/browse/BEAM-X)).
 -->
-# [2.35.0] - Unreleased
+# [2.35.1] - Unreleased
 
 ## Highlights
 
