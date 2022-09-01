@@ -25,6 +25,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.Matchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -32,12 +34,15 @@ import static org.mockito.Mockito.when;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.AbstractMap;
 import java.util.AbstractMap.SimpleEntry;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
@@ -52,6 +57,7 @@ import org.apache.beam.runners.dataflow.worker.windmill.Windmill;
 import org.apache.beam.runners.dataflow.worker.windmill.Windmill.TagBag;
 import org.apache.beam.runners.dataflow.worker.windmill.Windmill.TagSortedListUpdateRequest;
 import org.apache.beam.runners.dataflow.worker.windmill.Windmill.TagValue;
+import org.apache.beam.sdk.coders.ByteArrayCoder;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.Coder.Context;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
@@ -61,6 +67,7 @@ import org.apache.beam.sdk.state.BagState;
 import org.apache.beam.sdk.state.CombiningState;
 import org.apache.beam.sdk.state.GroupingState;
 import org.apache.beam.sdk.state.MapState;
+import org.apache.beam.sdk.state.MultimapState;
 import org.apache.beam.sdk.state.OrderedListState;
 import org.apache.beam.sdk.state.ReadableState;
 import org.apache.beam.sdk.state.ValueState;
@@ -80,6 +87,7 @@ import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.RangeSet
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.util.concurrent.Futures;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.util.concurrent.SettableFuture;
 import org.hamcrest.Matchers;
+import org.hamcrest.core.CombinableMatcher;
 import org.joda.time.Instant;
 import org.junit.After;
 import org.junit.Before;
@@ -643,6 +651,836 @@ public class WindmillStateInternalsTest {
     commitBuilder = Windmill.WorkItemCommitRequest.newBuilder();
     assertEquals(0, commitBuilder.getTagValuePrefixDeletesCount());
     assertEquals(0, commitBuilder.getValueUpdatesCount());
+  }
+
+  private static <T> ByteString encodeWithCoder(T key, Coder<T> coder) throws IOException {
+    ByteStringOutputStream out = new ByteStringOutputStream();
+    coder.encode(key, out);
+    return out.toByteString();
+  }
+
+  // We use the structural value of the Multimap keys to differentiate between different keys. So we
+  // mix using the original key object and a duplicate but same key object so make sure the
+  // correctness.
+  private static byte[] dup(byte[] key) {
+    byte[] res = new byte[key.length];
+    System.arraycopy(key, 0, res, 0, key.length);
+    return res;
+  }
+
+  @Test
+  public void testMultimapGet() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key = "key".getBytes(StandardCharsets.UTF_8);
+    SettableFuture<Iterable<Integer>> future = SettableFuture.create();
+    when(mockReader.multimapFetchSingleEntryFuture(
+            encodeWithCoder(key, ByteArrayCoder.of()),
+            key(NAMESPACE, tag),
+            STATE_FAMILY,
+            VarIntCoder.of()))
+        .thenReturn(future);
+
+    ReadableState<Iterable<Integer>> result = multimapState.get(dup(key)).readLater();
+    waitAndSet(future, Arrays.asList(1, 2, 3), 200);
+    assertThat(result.read(), Matchers.containsInAnyOrder(1, 2, 3));
+  }
+
+  @Test
+  public void testMultimapPutAndGet() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key = "key".getBytes(StandardCharsets.UTF_8);
+    SettableFuture<Iterable<Integer>> future = SettableFuture.create();
+    when(mockReader.multimapFetchSingleEntryFuture(
+            encodeWithCoder(key, ByteArrayCoder.of()),
+            key(NAMESPACE, tag),
+            STATE_FAMILY,
+            VarIntCoder.of()))
+        .thenReturn(future);
+
+    multimapState.put(key, 1);
+    ReadableState<Iterable<Integer>> result = multimapState.get(dup(key)).readLater();
+    waitAndSet(future, Arrays.asList(1, 2, 3), 200);
+    assertThat(result.read(), Matchers.containsInAnyOrder(1, 1, 2, 3));
+  }
+
+  @Test
+  public void testMultimapRemoveAndGet() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key = "key".getBytes(StandardCharsets.UTF_8);
+    SettableFuture<Iterable<Integer>> future = SettableFuture.create();
+    when(mockReader.multimapFetchSingleEntryFuture(
+            encodeWithCoder(key, ByteArrayCoder.of()),
+            key(NAMESPACE, tag),
+            STATE_FAMILY,
+            VarIntCoder.of()))
+        .thenReturn(future);
+
+    ReadableState<Iterable<Integer>> result = multimapState.get(key).readLater();
+    ReadableState<Iterable<Integer>> result2 = multimapState.get(dup(key)).readLater();
+    waitAndSet(future, Arrays.asList(1, 2, 3), 200);
+
+    assertTrue(multimapState.containsKey(key).read());
+    assertThat(result.read(), Matchers.containsInAnyOrder(1, 2, 3));
+
+    multimapState.remove(key);
+    assertFalse(multimapState.containsKey(dup(key)).read());
+    assertThat(result2.read(), Matchers.emptyIterable());
+  }
+
+  @Test
+  public void testMultimapRemoveThenPut() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key = "key".getBytes(StandardCharsets.UTF_8);
+    SettableFuture<Iterable<Integer>> future = SettableFuture.create();
+    when(mockReader.multimapFetchSingleEntryFuture(
+            encodeWithCoder(key, ByteArrayCoder.of()),
+            key(NAMESPACE, tag),
+            STATE_FAMILY,
+            VarIntCoder.of()))
+        .thenReturn(future);
+
+    ReadableState<Iterable<Integer>> result = multimapState.get(key).readLater();
+    waitAndSet(future, Arrays.asList(1, 2, 3), 200);
+    multimapState.remove(dup(key));
+    multimapState.put(key, 4);
+    multimapState.put(dup(key), 5);
+    assertThat(result.read(), Matchers.containsInAnyOrder(4, 5));
+  }
+
+  @Test
+  public void testMultimapGetLocalCombineStorage() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key = "key".getBytes(StandardCharsets.UTF_8);
+    SettableFuture<Iterable<Integer>> future = SettableFuture.create();
+    when(mockReader.multimapFetchSingleEntryFuture(
+            encodeWithCoder(key, ByteArrayCoder.of()),
+            key(NAMESPACE, tag),
+            STATE_FAMILY,
+            VarIntCoder.of()))
+        .thenReturn(future);
+
+    ReadableState<Iterable<Integer>> result = multimapState.get(dup(key)).readLater();
+    waitAndSet(future, Arrays.asList(1, 2), 200);
+    multimapState.put(key, 3);
+    multimapState.put(dup(key), 4);
+    assertFalse(multimapState.isEmpty().read());
+    assertThat(result.read(), Matchers.containsInAnyOrder(1, 2, 3, 4));
+  }
+
+  @Test
+  public void testMultimapLocalOverrideStorage() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key = "key".getBytes(StandardCharsets.UTF_8);
+    SettableFuture<Iterable<Integer>> future = SettableFuture.create();
+    when(mockReader.multimapFetchSingleEntryFuture(
+            encodeWithCoder(key, ByteArrayCoder.of()),
+            key(NAMESPACE, tag),
+            STATE_FAMILY,
+            VarIntCoder.of()))
+        .thenReturn(future);
+
+    ReadableState<Iterable<Integer>> result = multimapState.get(key).readLater();
+    waitAndSet(future, Arrays.asList(1, 2), 200);
+    multimapState.remove(dup(key));
+    assertThat(result.read(), Matchers.emptyIterable());
+    multimapState.put(key, 3);
+    multimapState.put(dup(key), 4);
+    assertFalse(multimapState.isEmpty().read());
+    assertThat(result.read(), Matchers.containsInAnyOrder(3, 4));
+  }
+
+  @Test
+  public void testMultimapLocalClearOverrideStorage() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key1 = "key1".getBytes(StandardCharsets.UTF_8);
+    final byte[] key2 = "key2".getBytes(StandardCharsets.UTF_8);
+    SettableFuture<Iterable<Integer>> future = SettableFuture.create();
+    when(mockReader.multimapFetchSingleEntryFuture(
+            encodeWithCoder(key1, ByteArrayCoder.of()),
+            key(NAMESPACE, tag),
+            STATE_FAMILY,
+            VarIntCoder.of()))
+        .thenReturn(future);
+    SettableFuture<Iterable<Integer>> future2 = SettableFuture.create();
+    when(mockReader.multimapFetchSingleEntryFuture(
+            encodeWithCoder(key2, ByteArrayCoder.of()),
+            key(NAMESPACE, tag),
+            STATE_FAMILY,
+            VarIntCoder.of()))
+        .thenReturn(future2);
+
+    ReadableState<Iterable<Integer>> result1 = multimapState.get(key1).readLater();
+    ReadableState<Iterable<Integer>> result2 = multimapState.get(dup(key2)).readLater();
+    multimapState.clear();
+    waitAndSet(future, Arrays.asList(1, 2), 200);
+    assertThat(result1.read(), Matchers.emptyIterable());
+    assertThat(result2.read(), Matchers.emptyIterable());
+    assertThat(multimapState.keys().read(), Matchers.emptyIterable());
+    assertThat(multimapState.entries().read(), Matchers.emptyIterable());
+    assertTrue(multimapState.isEmpty().read());
+  }
+
+  private static Map.Entry<ByteString, Iterable<Integer>> multimapEntry(
+      byte[] key, Integer... values) throws IOException {
+    return new AbstractMap.SimpleEntry<>(
+        encodeWithCoder(key, ByteArrayCoder.of()), Arrays.asList(values));
+  }
+
+  @SafeVarargs
+  private static <T> List<T> weightedList(T... entries) {
+    WindmillStateReader.WeightedList<T> list =
+        new WindmillStateReader.WeightedList<>(new ArrayList<>());
+    for (T entry : entries) {
+      list.addWeighted(entry, 1);
+    }
+    return list;
+  }
+
+  @Test
+  public void testMultimapBasicEntriesAndKeys() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key1 = "key1".getBytes(StandardCharsets.UTF_8);
+    final byte[] key2 = "key2".getBytes(StandardCharsets.UTF_8);
+
+    SettableFuture<Iterable<Map.Entry<ByteString, Iterable<Integer>>>> entriesFuture =
+        SettableFuture.create();
+    when(mockReader.multimapFetchAllFuture(
+            false, key(NAMESPACE, tag), STATE_FAMILY, VarIntCoder.of()))
+        .thenReturn(entriesFuture);
+    SettableFuture<Iterable<Map.Entry<ByteString, Iterable<Integer>>>> keysFuture =
+        SettableFuture.create();
+    when(mockReader.multimapFetchAllFuture(
+            true, key(NAMESPACE, tag), STATE_FAMILY, VarIntCoder.of()))
+        .thenReturn(keysFuture);
+
+    ReadableState<Iterable<Map.Entry<byte[], Integer>>> entriesResult =
+        multimapState.entries().readLater();
+    ReadableState<Iterable<byte[]>> keysResult = multimapState.keys().readLater();
+    waitAndSet(
+        entriesFuture,
+        Arrays.asList(multimapEntry(key1, 1, 2, 3), multimapEntry(key2, 2, 3, 4)),
+        200);
+    waitAndSet(keysFuture, Arrays.asList(multimapEntry(key1), multimapEntry(key2)), 200);
+
+    Iterable<Map.Entry<byte[], Integer>> entries = entriesResult.read();
+    assertEquals(6, Iterables.size(entries));
+    assertThat(
+        entries,
+        Matchers.containsInAnyOrder(
+            multimapEntryMatcher(key1, 1),
+            multimapEntryMatcher(key1, 2),
+            multimapEntryMatcher(key1, 3),
+            multimapEntryMatcher(key2, 4),
+            multimapEntryMatcher(key2, 2),
+            multimapEntryMatcher(key2, 3)));
+
+    Iterable<byte[]> keys = keysResult.read();
+    assertEquals(2, Iterables.size(keys));
+    assertThat(keys, Matchers.containsInAnyOrder(key1, key2));
+  }
+
+  private static CombinableMatcher<Object> multimapEntryMatcher(byte[] key, Integer value) {
+    return Matchers.both(Matchers.hasProperty("key", Matchers.equalTo(key)))
+        .and(Matchers.hasProperty("value", Matchers.equalTo(value)));
+  }
+
+  @Test
+  public void testMultimapEntriesAndKeysMergeLocalAdd() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key1 = "key1".getBytes(StandardCharsets.UTF_8);
+    final byte[] key2 = "key2".getBytes(StandardCharsets.UTF_8);
+    final byte[] key3 = "key3".getBytes(StandardCharsets.UTF_8);
+
+    SettableFuture<Iterable<Map.Entry<ByteString, Iterable<Integer>>>> entriesFuture =
+        SettableFuture.create();
+    when(mockReader.multimapFetchAllFuture(
+            false, key(NAMESPACE, tag), STATE_FAMILY, VarIntCoder.of()))
+        .thenReturn(entriesFuture);
+    SettableFuture<Iterable<Map.Entry<ByteString, Iterable<Integer>>>> keysFuture =
+        SettableFuture.create();
+    when(mockReader.multimapFetchAllFuture(
+            true, key(NAMESPACE, tag), STATE_FAMILY, VarIntCoder.of()))
+        .thenReturn(keysFuture);
+
+    ReadableState<Iterable<Map.Entry<byte[], Integer>>> entriesResult =
+        multimapState.entries().readLater();
+    ReadableState<Iterable<byte[]>> keysResult = multimapState.keys().readLater();
+    waitAndSet(
+        entriesFuture,
+        Arrays.asList(multimapEntry(key1, 1, 2, 3), multimapEntry(key2, 2, 3, 4)),
+        200);
+    waitAndSet(keysFuture, Arrays.asList(multimapEntry(key1), multimapEntry(key2)), 200);
+
+    multimapState.put(key1, 7);
+    multimapState.put(dup(key2), 8);
+    multimapState.put(dup(key3), 8);
+
+    Iterable<Map.Entry<byte[], Integer>> entries = entriesResult.read();
+    assertEquals(9, Iterables.size(entries));
+    assertThat(
+        entries,
+        Matchers.containsInAnyOrder(
+            multimapEntryMatcher(key1, 1),
+            multimapEntryMatcher(key1, 2),
+            multimapEntryMatcher(key1, 3),
+            multimapEntryMatcher(key1, 7),
+            multimapEntryMatcher(key2, 4),
+            multimapEntryMatcher(key2, 2),
+            multimapEntryMatcher(key2, 3),
+            multimapEntryMatcher(key2, 8),
+            multimapEntryMatcher(key3, 8)));
+
+    Iterable<byte[]> keys = keysResult.read();
+    assertThat(keys, Matchers.containsInAnyOrder(key1, key2, key3));
+  }
+
+  @Test
+  public void testMultimapEntriesAndKeysMergeLocalRemove() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key1 = "key1".getBytes(StandardCharsets.UTF_8);
+    final byte[] key2 = "key2".getBytes(StandardCharsets.UTF_8);
+    final byte[] key3 = "key3".getBytes(StandardCharsets.UTF_8);
+
+    SettableFuture<Iterable<Map.Entry<ByteString, Iterable<Integer>>>> entriesFuture =
+        SettableFuture.create();
+    when(mockReader.multimapFetchAllFuture(
+            false, key(NAMESPACE, tag), STATE_FAMILY, VarIntCoder.of()))
+        .thenReturn(entriesFuture);
+    SettableFuture<Iterable<Map.Entry<ByteString, Iterable<Integer>>>> keysFuture =
+        SettableFuture.create();
+    when(mockReader.multimapFetchAllFuture(
+            true, key(NAMESPACE, tag), STATE_FAMILY, VarIntCoder.of()))
+        .thenReturn(keysFuture);
+
+    ReadableState<Iterable<Map.Entry<byte[], Integer>>> entriesResult =
+        multimapState.entries().readLater();
+    ReadableState<Iterable<byte[]>> keysResult = multimapState.keys().readLater();
+    waitAndSet(
+        entriesFuture,
+        Arrays.asList(multimapEntry(key1, 1, 2, 3), multimapEntry(key2, 2, 3, 4)),
+        200);
+    waitAndSet(keysFuture, Arrays.asList(multimapEntry(key1), multimapEntry(key2)), 200);
+
+    multimapState.remove(dup(key1));
+    multimapState.put(key2, 8);
+    multimapState.put(dup(key3), 8);
+
+    Iterable<Map.Entry<byte[], Integer>> entries = entriesResult.read();
+    assertEquals(5, Iterables.size(entries));
+    assertThat(
+        entries,
+        Matchers.containsInAnyOrder(
+            multimapEntryMatcher(key2, 4),
+            multimapEntryMatcher(key2, 2),
+            multimapEntryMatcher(key2, 3),
+            multimapEntryMatcher(key2, 8),
+            multimapEntryMatcher(key3, 8)));
+
+    Iterable<byte[]> keys = keysResult.read();
+    assertThat(keys, Matchers.containsInAnyOrder(key2, key3));
+  }
+
+  @Test
+  public void testMultimapEntriesPaginated() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key1 = "key1".getBytes(StandardCharsets.UTF_8);
+    final byte[] key2 = "key2".getBytes(StandardCharsets.UTF_8);
+    final byte[] key3 = "key3".getBytes(StandardCharsets.UTF_8);
+
+    SettableFuture<Iterable<Map.Entry<ByteString, Iterable<Integer>>>> entriesFuture =
+        SettableFuture.create();
+    when(mockReader.multimapFetchAllFuture(
+            false, key(NAMESPACE, tag), STATE_FAMILY, VarIntCoder.of()))
+        .thenReturn(entriesFuture);
+    SettableFuture<Iterable<Map.Entry<ByteString, Iterable<Integer>>>> keysFuture =
+        SettableFuture.create();
+    when(mockReader.multimapFetchAllFuture(
+            true, key(NAMESPACE, tag), STATE_FAMILY, VarIntCoder.of()))
+        .thenReturn(keysFuture);
+
+    ReadableState<Iterable<Map.Entry<byte[], Integer>>> entriesResult =
+        multimapState.entries().readLater();
+    ReadableState<Iterable<byte[]>> keysResult = multimapState.keys().readLater();
+    waitAndSet(
+        entriesFuture,
+        weightedList(
+            multimapEntry(key1, 1, 2, 3),
+            // entry key2 is returned in 2 separate responses due to pagination.
+            multimapEntry(key2, 2, 3, 4),
+            multimapEntry(key2, 4, 5)),
+        200);
+    waitAndSet(keysFuture, Arrays.asList(multimapEntry(key1), multimapEntry(key2)), 200);
+
+    multimapState.remove(dup(key1));
+    multimapState.put(key2, 8);
+    multimapState.put(dup(key3), 8);
+
+    Iterable<Map.Entry<byte[], Integer>> entries = entriesResult.read();
+    assertThat(
+        entries,
+        Matchers.containsInAnyOrder(
+            multimapEntryMatcher(key2, 2),
+            multimapEntryMatcher(key2, 3),
+            multimapEntryMatcher(key2, 4),
+            multimapEntryMatcher(key2, 4),
+            multimapEntryMatcher(key2, 5),
+            multimapEntryMatcher(key2, 8),
+            multimapEntryMatcher(key3, 8)));
+    assertEquals(7, Iterables.size(entries));
+
+    Iterable<byte[]> keys = keysResult.read();
+    assertThat(keys, Matchers.containsInAnyOrder(key2, key3));
+  }
+
+  @Test
+  public void testMultimapCacheComplete() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key = "key".getBytes(StandardCharsets.UTF_8);
+
+    SettableFuture<Iterable<Map.Entry<ByteString, Iterable<Integer>>>> entriesFuture =
+        SettableFuture.create();
+    when(mockReader.multimapFetchAllFuture(
+            false, key(NAMESPACE, tag), STATE_FAMILY, VarIntCoder.of()))
+        .thenReturn(entriesFuture);
+
+    // to set up the multimap as cache complete
+    waitAndSet(entriesFuture, weightedList(multimapEntry(key, 1, 2, 3)), 200);
+    multimapState.entries().read();
+
+    multimapState.put(key, 2);
+
+    when(mockReader.multimapFetchAllFuture(
+            anyBoolean(), eq(key(NAMESPACE, tag)), eq(STATE_FAMILY), eq(VarIntCoder.of())))
+        .thenThrow(
+            new RuntimeException(
+                "The multimap is cache complete and should not perform any windmill read."));
+    when(mockReader.multimapFetchSingleEntryFuture(
+            any(), eq(key(NAMESPACE, tag)), eq(STATE_FAMILY), eq(VarIntCoder.of())))
+        .thenThrow(
+            new RuntimeException(
+                "The multimap is cache complete and should not perform any windmill read."));
+
+    Iterable<Map.Entry<byte[], Integer>> entries = multimapState.entries().read();
+    assertEquals(4, Iterables.size(entries));
+    assertThat(
+        entries,
+        Matchers.containsInAnyOrder(
+            multimapEntryMatcher(key, 1),
+            multimapEntryMatcher(key, 2),
+            multimapEntryMatcher(key, 3),
+            multimapEntryMatcher(key, 2)));
+
+    Iterable<byte[]> keys = multimapState.keys().read();
+    assertThat(keys, Matchers.containsInAnyOrder(key));
+
+    Iterable<Integer> values = multimapState.get(dup(key)).read();
+    assertThat(values, Matchers.containsInAnyOrder(1, 2, 2, 3));
+  }
+
+  @Test
+  public void testMultimapCachedSingleEntry() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key = "key".getBytes(StandardCharsets.UTF_8);
+
+    SettableFuture<Iterable<Integer>> entryFuture = SettableFuture.create();
+    when(mockReader.multimapFetchSingleEntryFuture(
+            encodeWithCoder(key, ByteArrayCoder.of()),
+            key(NAMESPACE, tag),
+            STATE_FAMILY,
+            VarIntCoder.of()))
+        .thenReturn(entryFuture);
+
+    // to set up the entry key as cache complete and add some local changes
+    waitAndSet(entryFuture, weightedList(1, 2, 3), 200);
+    multimapState.get(key).read();
+    multimapState.put(key, 2);
+
+    when(mockReader.multimapFetchSingleEntryFuture(
+            eq(encodeWithCoder(key, ByteArrayCoder.of())),
+            eq(key(NAMESPACE, tag)),
+            eq(STATE_FAMILY),
+            eq(VarIntCoder.of())))
+        .thenThrow(
+            new RuntimeException(
+                "The multimap is cache complete for "
+                    + Arrays.toString(key)
+                    + " and should not perform any windmill read."));
+
+    Iterable<Integer> values = multimapState.get(dup(key)).read();
+    assertThat(values, Matchers.containsInAnyOrder(1, 2, 2, 3));
+    assertTrue(multimapState.containsKey(key).read());
+  }
+
+  @Test
+  public void testMultimapCachedPartialEntry() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key1 = "key1".getBytes(StandardCharsets.UTF_8);
+    final byte[] key2 = "key2".getBytes(StandardCharsets.UTF_8);
+    final byte[] key3 = "key3".getBytes(StandardCharsets.UTF_8);
+
+    SettableFuture<Iterable<Integer>> entryFuture = SettableFuture.create();
+    when(mockReader.multimapFetchSingleEntryFuture(
+            encodeWithCoder(key1, ByteArrayCoder.of()),
+            key(NAMESPACE, tag),
+            STATE_FAMILY,
+            VarIntCoder.of()))
+        .thenReturn(entryFuture);
+
+    // to set up the entry key1 as cache complete and add some local changes
+    waitAndSet(entryFuture, weightedList(1, 2, 3), 200);
+    multimapState.get(key1).read();
+    multimapState.put(key1, 2);
+    multimapState.put(key3, 20);
+
+    SettableFuture<Iterable<Map.Entry<ByteString, Iterable<Integer>>>> entriesFuture =
+        SettableFuture.create();
+    when(mockReader.multimapFetchAllFuture(
+            false, key(NAMESPACE, tag), STATE_FAMILY, VarIntCoder.of()))
+        .thenReturn(entriesFuture);
+
+    // windmill contains extra entry key2
+    waitAndSet(
+        entriesFuture,
+        weightedList(multimapEntry(key1, 1, 2, 3), multimapEntry(key2, 4, 5, 6)),
+        200);
+
+    // key1 exist in both cache and windmill; key2 exists only in windmill; key3 exists only in
+    // cache. They should all be merged.
+    Iterable<Map.Entry<byte[], Integer>> entries = multimapState.entries().read();
+
+    assertEquals(8, Iterables.size(entries));
+    assertThat(
+        entries,
+        Matchers.containsInAnyOrder(
+            multimapEntryMatcher(key1, 1),
+            multimapEntryMatcher(key1, 2),
+            multimapEntryMatcher(key1, 2),
+            multimapEntryMatcher(key1, 3),
+            multimapEntryMatcher(key2, 4),
+            multimapEntryMatcher(key2, 5),
+            multimapEntryMatcher(key2, 6),
+            multimapEntryMatcher(key3, 20)));
+
+    assertThat(multimapState.keys().read(), Matchers.containsInAnyOrder(key1, key2, key3));
+  }
+
+  @Test
+  public void testMultimapCachedPartialEntryCannotCachePolled() throws IOException {
+    final String tag = "multimap";
+    StateTag<MultimapState<byte[], Integer>> addr =
+        StateTags.multimap(tag, ByteArrayCoder.of(), VarIntCoder.of());
+    MultimapState<byte[], Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final byte[] key1 = "key1".getBytes(StandardCharsets.UTF_8);
+    final byte[] key2 = "key2".getBytes(StandardCharsets.UTF_8);
+    final byte[] key3 = "key3".getBytes(StandardCharsets.UTF_8);
+
+    SettableFuture<Iterable<Integer>> entryFuture = SettableFuture.create();
+    when(mockReader.multimapFetchSingleEntryFuture(
+            encodeWithCoder(key1, ByteArrayCoder.of()),
+            key(NAMESPACE, tag),
+            STATE_FAMILY,
+            VarIntCoder.of()))
+        .thenReturn(entryFuture);
+
+    // to set up the entry key1 as cache complete and add some local changes
+    waitAndSet(entryFuture, weightedList(1, 2, 3), 200);
+    multimapState.get(key1).read();
+    multimapState.put(dup(key1), 2);
+    multimapState.put(dup(key3), 20);
+
+    SettableFuture<Iterable<Map.Entry<ByteString, Iterable<Integer>>>> entriesFuture =
+        SettableFuture.create();
+    when(mockReader.multimapFetchAllFuture(
+            false, key(NAMESPACE, tag), STATE_FAMILY, VarIntCoder.of()))
+        .thenReturn(entriesFuture);
+    SettableFuture<Iterable<Map.Entry<ByteString, Iterable<Integer>>>> keysFuture =
+        SettableFuture.create();
+    when(mockReader.multimapFetchAllFuture(
+            true, key(NAMESPACE, tag), STATE_FAMILY, VarIntCoder.of()))
+        .thenReturn(keysFuture);
+
+    // windmill contains extra entry key2, and this time the entries returned should not be cached.
+    waitAndSet(
+        entriesFuture,
+        Arrays.asList(multimapEntry(key1, 1, 2, 3), multimapEntry(key2, 4, 5, 6)),
+        200);
+    waitAndSet(keysFuture, Arrays.asList(multimapEntry(key1), multimapEntry(key2)), 200);
+
+    // key1 exist in both cache and windmill; key2 exists only in windmill; key3 exists only in
+    // cache. They should all be merged.
+    Iterable<Map.Entry<byte[], Integer>> entries = multimapState.entries().read();
+
+    assertEquals(8, Iterables.size(entries));
+    assertThat(
+        entries,
+        Matchers.containsInAnyOrder(
+            multimapEntryMatcher(key1, 1),
+            multimapEntryMatcher(key1, 2),
+            multimapEntryMatcher(key1, 2),
+            multimapEntryMatcher(key1, 3),
+            multimapEntryMatcher(key2, 4),
+            multimapEntryMatcher(key2, 5),
+            multimapEntryMatcher(key2, 6),
+            multimapEntryMatcher(key3, 20)));
+
+    assertThat(multimapState.keys().read(), Matchers.containsInAnyOrder(key1, key2, key3));
+  }
+
+  private static class MultimapEntryUpdate {
+    String key;
+    Iterable<Integer> values;
+    boolean deleteAll;
+
+    public MultimapEntryUpdate(String key, Iterable<Integer> values, boolean deleteAll) {
+      this.key = key;
+      this.values = values;
+      this.deleteAll = deleteAll;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (!(o instanceof MultimapEntryUpdate)) return false;
+      MultimapEntryUpdate that = (MultimapEntryUpdate) o;
+      return deleteAll == that.deleteAll
+          && Objects.equals(key, that.key)
+          && Objects.equals(values, that.values);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(key, values, deleteAll);
+    }
+  }
+
+  private static MultimapEntryUpdate decodeTagMultimapEntry(Windmill.TagMultimapEntry entryProto) {
+    try {
+      String key = StringUtf8Coder.of().decode(entryProto.getEntryName().newInput());
+      List<Integer> values = new ArrayList<>();
+      for (ByteString value : entryProto.getValuesList()) {
+        values.add(VarIntCoder.of().decode(value.newInput()));
+      }
+      return new MultimapEntryUpdate(key, values, entryProto.getDeleteAll());
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private static void assertTagMultimapUpdates(
+      Windmill.TagMultimapUpdateRequest.Builder updates, MultimapEntryUpdate... expected) {
+    assertThat(
+        updates.getUpdatesList().stream()
+            .map(WindmillStateInternalsTest::decodeTagMultimapEntry)
+            .collect(Collectors.toList()),
+        Matchers.containsInAnyOrder(expected));
+  }
+
+  @Test
+  public void testMultimapPutAndPersist() {
+    final String tag = "multimap";
+    StateTag<MultimapState<String, Integer>> addr =
+        StateTags.multimap(tag, StringUtf8Coder.of(), VarIntCoder.of());
+    MultimapState<String, Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final String key1 = "key1";
+    final String key2 = "key2";
+
+    multimapState.put(key1, 1);
+    multimapState.put(key1, 2);
+    multimapState.put(key2, 2);
+
+    Windmill.WorkItemCommitRequest.Builder commitBuilder =
+        Windmill.WorkItemCommitRequest.newBuilder();
+    underTest.persist(commitBuilder);
+
+    assertEquals(1, commitBuilder.getMultimapUpdatesCount());
+    Windmill.TagMultimapUpdateRequest.Builder builder =
+        Iterables.getOnlyElement(commitBuilder.getMultimapUpdatesBuilderList());
+    assertTagMultimapUpdates(
+        builder,
+        new MultimapEntryUpdate(key1, Arrays.asList(1, 2), false),
+        new MultimapEntryUpdate(key2, Arrays.asList(2), false));
+  }
+
+  @Test
+  public void testMultimapRemovePutAndPersist() {
+    final String tag = "multimap";
+    StateTag<MultimapState<String, Integer>> addr =
+        StateTags.multimap(tag, StringUtf8Coder.of(), VarIntCoder.of());
+    MultimapState<String, Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final String key1 = "key1";
+    final String key2 = "key2";
+
+    // we should add 1 and 2 to key1
+    multimapState.remove(key1);
+    multimapState.put(key1, 1);
+    multimapState.put(key1, 2);
+    // we should not add 2 to key 2
+    multimapState.put(key2, 2);
+    multimapState.remove(key2);
+    // we should add 4 to key 2
+    multimapState.put(key2, 4);
+
+    Windmill.WorkItemCommitRequest.Builder commitBuilder =
+        Windmill.WorkItemCommitRequest.newBuilder();
+    underTest.persist(commitBuilder);
+
+    assertEquals(1, commitBuilder.getMultimapUpdatesCount());
+    Windmill.TagMultimapUpdateRequest.Builder builder =
+        Iterables.getOnlyElement(commitBuilder.getMultimapUpdatesBuilderList());
+    assertTagMultimapUpdates(
+        builder,
+        new MultimapEntryUpdate(key1, Arrays.asList(1, 2), true),
+        new MultimapEntryUpdate(key2, Arrays.asList(4), true));
+  }
+
+  @Test
+  public void testMultimapRemoveAndPersist() {
+    final String tag = "multimap";
+    StateTag<MultimapState<String, Integer>> addr =
+        StateTags.multimap(tag, StringUtf8Coder.of(), VarIntCoder.of());
+    MultimapState<String, Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final String key1 = "key1";
+    final String key2 = "key2";
+
+    multimapState.remove(key1);
+    multimapState.remove(key2);
+
+    Windmill.WorkItemCommitRequest.Builder commitBuilder =
+        Windmill.WorkItemCommitRequest.newBuilder();
+    underTest.persist(commitBuilder);
+
+    assertEquals(1, commitBuilder.getMultimapUpdatesCount());
+    Windmill.TagMultimapUpdateRequest.Builder builder =
+        Iterables.getOnlyElement(commitBuilder.getMultimapUpdatesBuilderList());
+    assertTagMultimapUpdates(
+        builder,
+        new MultimapEntryUpdate(key1, Collections.emptyList(), true),
+        new MultimapEntryUpdate(key2, Collections.emptyList(), true));
+  }
+
+  @Test
+  public void testMultimapPutRemoveClearAndPersist() {
+    final String tag = "multimap";
+    StateTag<MultimapState<String, Integer>> addr =
+        StateTags.multimap(tag, StringUtf8Coder.of(), VarIntCoder.of());
+    MultimapState<String, Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final String key1 = "key1";
+    final String key2 = "key2";
+    final String key3 = "key3";
+
+    // no need to send any put/remove if clear is called later
+    multimapState.put(key1, 1);
+    multimapState.put(key2, 2);
+    multimapState.remove(key2);
+    multimapState.clear();
+    // remove without put sent after clear should also not be added: we are cache complete after
+    // clear, so we know we can skip unnecessary remove.
+    multimapState.remove(key3);
+
+    Windmill.WorkItemCommitRequest.Builder commitBuilder =
+        Windmill.WorkItemCommitRequest.newBuilder();
+    underTest.persist(commitBuilder);
+
+    assertEquals(1, commitBuilder.getMultimapUpdatesCount());
+    Windmill.TagMultimapUpdateRequest.Builder builder =
+        Iterables.getOnlyElement(commitBuilder.getMultimapUpdatesBuilderList());
+    assertEquals(0, builder.getUpdatesCount());
+    assertTrue(builder.getDeleteAll());
+  }
+
+  @Test
+  public void testMultimapClearPutRemoveAndPersist() {
+    final String tag = "multimap";
+    StateTag<MultimapState<String, Integer>> addr =
+        StateTags.multimap(tag, StringUtf8Coder.of(), VarIntCoder.of());
+    MultimapState<String, Integer> multimapState = underTest.state(NAMESPACE, addr);
+
+    final String key1 = "key1";
+    final String key2 = "key2";
+
+    // no need to send any put/remove if clear is called later
+    multimapState.put(key1, 1);
+    multimapState.put(key2, 2);
+    multimapState.remove(key2);
+    multimapState.clear();
+
+    // put after clear should be sent
+    multimapState.put(key1, 4);
+
+    // put then remove should not be sent
+    multimapState.put(key2, 5);
+    multimapState.remove(key2);
+
+    Windmill.WorkItemCommitRequest.Builder commitBuilder =
+        Windmill.WorkItemCommitRequest.newBuilder();
+    underTest.persist(commitBuilder);
+
+    assertEquals(1, commitBuilder.getMultimapUpdatesCount());
+    Windmill.TagMultimapUpdateRequest.Builder builder =
+        Iterables.getOnlyElement(commitBuilder.getMultimapUpdatesBuilderList());
+    assertTagMultimapUpdates(builder, new MultimapEntryUpdate(key1, Arrays.asList(4), false));
+    assertTrue(builder.getDeleteAll());
   }
 
   public static final Range<Long> FULL_ORDERED_LIST_RANGE =
