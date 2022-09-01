@@ -125,6 +125,7 @@ import org.apache.beam.sdk.runners.PTransformOverrideFactory;
 import org.apache.beam.sdk.runners.TransformHierarchy;
 import org.apache.beam.sdk.runners.TransformHierarchy.Node;
 import org.apache.beam.sdk.state.MapState;
+import org.apache.beam.sdk.state.MultimapState;
 import org.apache.beam.sdk.state.SetState;
 import org.apache.beam.sdk.transforms.Combine;
 import org.apache.beam.sdk.transforms.Combine.CombineFn;
@@ -2430,6 +2431,13 @@ public class DataflowRunner extends PipelineRunner<DataflowPipelineJob> {
 
     boolean streamingEngine = useStreamingEngine(options);
     boolean isUnifiedWorker = useUnifiedWorker(options);
+
+    if (DoFnSignatures.usesMultimapState(fn) && isUnifiedWorker) {
+      throw new UnsupportedOperationException(
+          String.format(
+              "%s does not currently support %s running using streaming on unified worker",
+              DataflowRunner.class.getSimpleName(), MultimapState.class.getSimpleName()));
+    }
     if (DoFnSignatures.usesSetState(fn)) {
       if (streaming && (isUnifiedWorker || streamingEngine)) {
         throw new UnsupportedOperationException(

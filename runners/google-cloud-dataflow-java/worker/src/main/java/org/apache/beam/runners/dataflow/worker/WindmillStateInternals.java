@@ -90,12 +90,14 @@ import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.annotations.Visi
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Optional;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Supplier;
+import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ArrayListMultimap;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.BoundType;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterables;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Iterators;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Maps;
+import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Multimap;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Range;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.RangeSet;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Sets;
@@ -198,8 +200,15 @@ class WindmillStateInternals<K> implements StateInternals {
             StateTag<MultimapState<KeyT, ValueT>> spec,
             Coder<KeyT> keyCoder,
             Coder<ValueT> valueCoder) {
-          throw new UnsupportedOperationException(
-              String.format("%s is not supported", MultimapState.class.getSimpleName()));
+          WindmillMultimap<KeyT, ValueT> result =
+              (WindmillMultimap<KeyT, ValueT>) cache.get(namespace, spec);
+          if (result == null) {
+            result =
+                new WindmillMultimap<>(
+                    namespace, spec, stateFamily, keyCoder, valueCoder, isNewKey);
+          }
+          result.initializeForWorkItem(reader, scopedReadStateSupplier);
+          return result;
         }
 
         @Override
@@ -1583,7 +1592,423 @@ class WindmillStateInternals<K> implements StateInternals {
         return reader.valuePrefixFuture(stateKeyPrefix, stateFamily, valueCoder);
       }
     }
-  };
+  }
+
+  @SuppressWarnings("UnusedNestedClass")
+  private static class WindmillMultimap<K, V> extends SimpleWindmillState
+      implements MultimapState<K, V> {
+
+    private final StateNamespace namespace;
+    private final StateTag<MultimapState<K, V>> address;
+    private final ByteString stateKey;
+    private final String stateFamily;
+    private final Coder<K> keyCoder;
+    private final Coder<V> valueCoder;
+
+    private boolean cleared = false;
+    /**
+     * For any given key, if it's contained in {@link #cachedEntries}, this contains the complete
+     * contents of the key and the values mapped by this key, except for any local additions. If
+     * it's not contained then we don't know if Windmill contains additional values which also maps
+     * to this key. We'll need to read them if the work item actually wants the content.
+     */
+    private Map<K, Iterable<V>> cachedEntries = Maps.newHashMap();
+    // Any key presents in existKeyCache is known to exist in the multimap.
+    private Set<K> existKeyCache = Sets.newHashSet();
+    // If true, any key not in existKeyCache is known to not exist.
+    private boolean allKeysKnown = false;
+    // Any key presents in nonexistentKeyCache is known not exist in the multimap.
+    private Set<K> nonexistentKeyCache = Sets.newHashSet();
+
+    private boolean complete = false;
+    private Multimap<K, V> localAdditions = ArrayListMultimap.create();
+    // All keys that are pending delete. If a key exist in both localRemovals and localAdditions:
+    // new values in localAdditions will be added after old values are removed.
+    private Set<K> localRemovals = Sets.newHashSet();
+
+    // TODO(buqian) to check:
+    // check this is correct: remove(k) so that key is in localRemovals; entries() so that
+    // nonexistentKeyCache is cleared;
+    // now k exists in localRemovals but not nonexistentKeyCache. methods should behave correctly.
+    //
+    // localRemovals/cleared must only be reset after the intent has been sent to windmill;
+    // localAdditions may be cleared without sent to windmill if remove() is called before that.
+
+    private WindmillMultimap(
+        StateNamespace namespace,
+        StateTag<MultimapState<K, V>> address,
+        String stateFamily,
+        Coder<K> keyCoder,
+        Coder<V> valueCoder,
+        boolean isNewShardingKey) {
+      this.namespace = namespace;
+      this.address = address;
+      this.stateKey = encodeKey(namespace, address);
+      this.stateFamily = stateFamily;
+      this.keyCoder = keyCoder;
+      this.valueCoder = valueCoder;
+      this.complete = isNewShardingKey;
+      this.allKeysKnown = isNewShardingKey;
+    }
+
+    @Override
+    public void put(K key, V value) {
+      localAdditions.put(key, value);
+      existKeyCache.add(key);
+      nonexistentKeyCache.remove(key);
+    }
+
+    private Future<Iterable<Map.Entry<ByteString, Iterable<V>>>> getFuture(boolean omitValues) {
+      if (complete) {
+        return Futures.immediateFuture(Collections.emptyList());
+      } else {
+        return reader.multimapFetchAllFuture(omitValues, stateKey, stateFamily, valueCoder);
+      }
+    }
+
+    private Future<Iterable<V>> getFutureForKey(K key) {
+      try {
+        ByteStringOutputStream keyStream = new ByteStringOutputStream();
+        keyCoder.encode(key, keyStream);
+        return reader.multimapFetchSingleEntryFuture(
+            keyStream.toByteString(), stateKey, stateFamily, valueCoder);
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
+    }
+
+    @Override
+    // TODO(buqian): add @UnknownKeyFor @NonNull @Initialized to many stuff. Refer to WindmillMap.
+    public @UnknownKeyFor @NonNull @Initialized ReadableState<Iterable<V>> get(K key) {
+      return new ReadableState<Iterable<V>>() {
+        @Override
+        public @UnknownKeyFor @NonNull @Initialized Iterable<V> read() {
+          if (nonexistentKeyCache.contains(key) || (!existKeyCache.contains(key) && allKeysKnown)) {
+            return Collections.emptyList();
+          }
+          if (localRemovals.contains(key)) {
+            // this key has been removed locally but the removal hasn't been sent to windmill,
+            // thus values in windmill(if any) are obselete.
+            if (localAdditions.containsKey(key)) {
+              return Iterables.unmodifiableIterable(localAdditions.get(key));
+            } else {
+              return Collections.emptyList();
+            }
+          }
+          if (cachedEntries.containsKey(key) || complete) {
+            return Iterables.unmodifiableIterable(
+                Iterables.concat(
+                    cachedEntries.getOrDefault(key, Collections.emptyList()),
+                    localAdditions.get(key)));
+          }
+          Future<Iterable<V>> persistedData = getFutureForKey(key);
+          try (Closeable scope = scopedReadState()) {
+            Iterable<V> persistedValues = persistedData.get();
+            if (Iterables.size(persistedValues) == 0) {
+              if (!localAdditions.containsKey(key)) {
+                nonexistentKeyCache.add(key);
+                Preconditions.checkState(
+                    !existKeyCache.contains(key),
+                    "Key "
+                        + key
+                        + " exists"
+                        + " in existKeyCache but no value in neither windmill nor local additions.");
+              }
+              return Iterables.unmodifiableIterable(localAdditions.get(key));
+            }
+            if (persistedValues instanceof Weighted) {
+              cachedEntries.put(key, new ConcatIterables<>());
+              ((ConcatIterables<V>) cachedEntries.get(key)).extendWith(persistedValues);
+            }
+            return Iterables.unmodifiableIterable(
+                Iterables.concat(persistedValues, localAdditions.get(key)));
+          } catch (InterruptedException | ExecutionException | IOException e) {
+            if (e instanceof InterruptedException) {
+              Thread.currentThread().interrupt();
+            }
+            throw new RuntimeException("Unable to read Multimap state", e);
+          }
+        }
+
+        @Override
+        @SuppressWarnings("FutureReturnValueIgnored")
+        public @UnknownKeyFor @NonNull @Initialized ReadableState<Iterable<V>> readLater() {
+          WindmillMultimap.this.getFutureForKey(key);
+          return this;
+        }
+      };
+    }
+
+    @Override
+    protected WorkItemCommitRequest persistDirectly(WindmillStateCache.ForKeyAndFamily cache)
+        throws IOException {
+      if (!cleared && localAdditions.isEmpty() && localRemovals.isEmpty()) {
+        return WorkItemCommitRequest.newBuilder().buildPartial();
+      }
+      WorkItemCommitRequest.Builder commitBuilder = WorkItemCommitRequest.newBuilder();
+      Windmill.TagMultimapUpdateRequest.Builder builder = null;
+      if (cleared) {
+        builder = commitBuilder.addMultimapUpdatesBuilder();
+        builder.setDeleteAll(true);
+        cleared = false;
+      }
+      Set<K> keysWithUpdates = Sets.newHashSet();
+      keysWithUpdates.addAll(localRemovals);
+      keysWithUpdates.addAll(localAdditions.keySet());
+      if (!keysWithUpdates.isEmpty() && builder == null) {
+        builder = commitBuilder.addMultimapUpdatesBuilder();
+      }
+      for (K key : keysWithUpdates) {
+        ByteStringOutputStream keyStream = new ByteStringOutputStream();
+        keyCoder.encode(key, keyStream);
+        ByteString encodedKey = keyStream.toByteString();
+        Windmill.TagMultimapEntry.Builder entryBuilder = builder.addUpdatesBuilder();
+        entryBuilder.setEntryName(encodedKey);
+        entryBuilder.setDeleteAll(localRemovals.contains(key));
+        for (V value : localAdditions.get(key)) {
+          ByteStringOutputStream valueStream = new ByteStringOutputStream();
+          valueCoder.encode(value, valueStream);
+          ByteString encodedValue = valueStream.toByteString();
+          entryBuilder.addValues(encodedValue);
+        }
+        if (cachedEntries.containsKey(key)) {
+          ((ConcatIterables<V>) cachedEntries.get(key)).extendWith(localAdditions.get(key));
+        }
+      }
+
+      if (builder != null) {
+        builder.setTag(stateKey).setStateFamily(stateFamily);
+      }
+      localRemovals = Sets.newHashSet();
+      localAdditions = ArrayListMultimap.create();
+
+      // TODO(buqian): track the size of each multimap entry
+      cache.put(namespace, address, this, 1);
+
+      return commitBuilder.buildPartial();
+    }
+
+    @Override
+    public void remove(K key) {
+      if (nonexistentKeyCache.contains(key) || (allKeysKnown && !existKeyCache.contains(key))) {
+        return;
+      }
+      if (cachedEntries.containsKey(key) || !complete) {
+        // there may be data in windmill that need to be removed.
+        localRemovals.add(key);
+        cachedEntries.remove(key);
+      } // else: no data in windmill, deleting from local cache is sufficient.
+      localAdditions.removeAll(key);
+      existKeyCache.remove(key);
+      nonexistentKeyCache.add(key);
+    }
+
+    @Override
+    public void clear() {
+      cleared = true;
+      complete = true;
+      allKeysKnown = true;
+      cachedEntries = Maps.newHashMap();
+      existKeyCache = Sets.newHashSet();
+      nonexistentKeyCache = Sets.newHashSet();
+      localAdditions = ArrayListMultimap.create();
+      localRemovals = Sets.newHashSet();
+    }
+
+    @Override
+    public ReadableState<Iterable<K>> keys() {
+      return new ReadableState<Iterable<K>>() {
+        @Override
+        public Iterable<K> read() {
+          if (allKeysKnown) {
+            return Iterables.unmodifiableIterable(existKeyCache);
+          }
+          Future<Iterable<Entry<ByteString, Iterable<V>>>> persistedData = getFuture(true);
+          try (Closeable scope = scopedReadState()) {
+            Iterable<Entry<ByteString, Iterable<V>>> entries = persistedData.get();
+            Iterable<K> keys =
+                Iterables.transform(
+                    entries,
+                    entry -> {
+                      try {
+                        return keyCoder.decode(entry.getKey().newInput());
+                      } catch (IOException e) {
+                        throw new RuntimeException(e);
+                      }
+                    });
+            keys = Iterables.filter(keys, key -> !nonexistentKeyCache.contains(key));
+            if (entries instanceof Weighted) {
+              // This is a known amount of data, cache them all.
+              keys.forEach(existKeyCache::add);
+              allKeysKnown = true;
+              nonexistentKeyCache = Sets.newHashSet();
+              return Iterables.unmodifiableIterable(existKeyCache);
+            } else {
+              return Iterables.unmodifiableIterable(
+                  Iterables.concat(
+                      // This is the part of keys that are cached.
+                      existKeyCache,
+                      // This is the part of the keys returned from Windmill that are not cached.
+                      Iterables.filter(keys, e -> !existKeyCache.contains(e))));
+            }
+          } catch (InterruptedException | ExecutionException | IOException e) {
+            if (e instanceof InterruptedException) {
+              Thread.currentThread().interrupt();
+            }
+            throw new RuntimeException("Unable to read state", e);
+          }
+        }
+
+        @Override
+        @SuppressWarnings("FutureReturnValueIgnored")
+        public ReadableState<Iterable<K>> readLater() {
+          WindmillMultimap.this.getFuture(true);
+          return this;
+        }
+      };
+    }
+
+    private Map<K, Iterable<V>> mergedCachedEntries() {
+      Map<K, Iterable<V>> merged = Maps.newHashMap();
+      for (K k : localAdditions.keySet()) {
+        if (!merged.containsKey(k)) merged.put(k, new ConcatIterables<>());
+        ((ConcatIterables<V>) merged.get(k)).extendWith(localAdditions.get(k));
+      }
+      for (K k : cachedEntries.keySet()) {
+        if (!merged.containsKey(k)) merged.put(k, new ConcatIterables<>());
+        ((ConcatIterables<V>) merged.get(k)).extendWith(cachedEntries.get(k));
+      }
+      return merged;
+    }
+
+    @Override
+    public ReadableState<Iterable<Entry<K, Iterable<V>>>> entries() {
+      return new ReadableState<Iterable<Entry<K, Iterable<V>>>>() {
+        @Override
+        public Iterable<Entry<K, Iterable<V>>> read() {
+          if (complete) {
+            return Iterables.unmodifiableIterable(mergedCachedEntries().entrySet());
+          }
+          Future<Iterable<Entry<ByteString, Iterable<V>>>> persistedData = getFuture(false);
+          try (Closeable scope = scopedReadState()) {
+            Iterable<Entry<ByteString, Iterable<V>>> entries = persistedData.get();
+            Map<K, ConcatIterables<V>> entryMap = Maps.newHashMap();
+            entries.forEach(
+                entry -> {
+                  try {
+                    K key = keyCoder.decode(entry.getKey().newInput());
+                    if (nonexistentKeyCache.contains(key)) return;
+                    if (entryMap.containsKey(key)) {
+                      entryMap.get(key).extendWith(entry.getValue());
+                    } else {
+                      entryMap.put(key, new ConcatIterables<>());
+                      entryMap.get(key).extendWith(entry.getValue());
+                    }
+                  } catch (IOException e) {
+                    throw new RuntimeException(e);
+                  }
+                });
+            if (entries instanceof Weighted) {
+              // This is a known amount of data, cache them all.
+              entryMap.forEach(
+                  (key, values) -> {
+                    if (!cachedEntries.containsKey(key)) {
+                      existKeyCache.add(key);
+                      cachedEntries.put(key, values);
+                    }
+                  });
+              allKeysKnown = true;
+              complete = true;
+              nonexistentKeyCache = Sets.newHashSet();
+              return Iterables.unmodifiableIterable(mergedCachedEntries().entrySet());
+            } else {
+              Map<K, Iterable<V>> local = mergedCachedEntries();
+              entryMap.forEach(
+                  (k, values) -> {
+                    if (!local.containsKey(k)) {
+                      local.put(k, new ConcatIterables<>());
+                    }
+                    if (!cachedEntries.containsKey(k)) {
+                      ((ConcatIterables<V>) local.get(k)).extendWith(values);
+                    }
+                  });
+              return Iterables.unmodifiableIterable(local.entrySet());
+            }
+          } catch (InterruptedException | ExecutionException | IOException e) {
+            if (e instanceof InterruptedException) {
+              Thread.currentThread().interrupt();
+            }
+            throw new RuntimeException("Unable to read state", e);
+          }
+        }
+
+        @Override
+        @SuppressWarnings("FutureReturnValueIgnored")
+        public ReadableState<Iterable<Entry<K, Iterable<V>>>> readLater() {
+          WindmillMultimap.this.getFuture(false);
+          return this;
+        }
+      };
+    }
+
+    @Override
+    public ReadableState<Boolean> containsKey(K key) {
+      return new ReadableState<Boolean>() {
+        /**
+         * TODO(buqian): Similar to {@link WindmillMap#isEmpty()}: can we find a more efficient way?
+         */
+        ReadableState<Iterable<V>> values = null;
+
+        @Override
+        public Boolean read() {
+          if (existKeyCache.contains(key)) return true;
+          if (nonexistentKeyCache.contains(key)) return false;
+          if (values == null) {
+            values = WindmillMultimap.this.get(key);
+          }
+          Iterable<V> it = values.read();
+          return !Iterables.isEmpty(it);
+        }
+
+        @Override
+        public ReadableState<Boolean> readLater() {
+          if (values == null) {
+            values = WindmillMultimap.this.get(key);
+          }
+          values.readLater();
+          return this;
+        }
+      };
+    }
+
+    @Override
+    public ReadableState<Boolean> isEmpty() {
+      return new ReadableState<Boolean>() {
+        /**
+         * TODO(buqian): Similar to {@link WindmillMap#isEmpty()}: can we find a more efficient way?
+         */
+        ReadableState<Iterable<K>> keys = null;
+
+        @Override
+        public Boolean read() {
+          if (!existKeyCache.isEmpty()) return false;
+          if (keys == null) {
+            keys = WindmillMultimap.this.keys();
+          }
+          return Iterables.isEmpty(keys.read());
+        }
+
+        @Override
+        public ReadableState<Boolean> readLater() {
+          if (keys == null) {
+            keys = WindmillMultimap.this.keys();
+          }
+          keys.readLater();
+          return this;
+        }
+      };
+    }
+  }
 
   private static class WindmillBag<T> extends SimpleWindmillState implements BagState<T> {
 
