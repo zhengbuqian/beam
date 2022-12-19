@@ -431,7 +431,6 @@ public class WindmillStateReaderTest {
     // Iterate over the results to force loading all the pages.
     for (Integer unused : results1) {}
     for (Integer unused : results2) {}
-    // TODO: why we can't test this like normal paginated requests?
 
     final ArgumentCaptor<Windmill.KeyedGetDataRequest> requestCaptor =
         ArgumentCaptor.forClass(Windmill.KeyedGetDataRequest.class);

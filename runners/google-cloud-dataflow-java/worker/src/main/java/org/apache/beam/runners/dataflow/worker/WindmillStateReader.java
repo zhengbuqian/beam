@@ -833,9 +833,6 @@ class WindmillStateReader {
       consumeSortedList(sorted_list, stateTag);
     }
 
-    // TODO(buqian): For the remaining MULTIMAP stateTags in toFetch, we only have one
-    // TagMultimapFetchResponse.
-    // toFetch should contain either 1 keys(), or 1 entries(), or 1+ get()
     for (Windmill.TagMultimapFetchResponse tagMultimap : response.getTagMultimapsList()) {
       // First check if it's keys()/entries()
       StateTag.Builder<ByteString> builder =

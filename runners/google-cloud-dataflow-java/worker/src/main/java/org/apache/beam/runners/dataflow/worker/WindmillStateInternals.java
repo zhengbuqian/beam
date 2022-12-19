@@ -1799,7 +1799,6 @@ class WindmillStateInternals<K> implements StateInternals {
       localRemovals = Sets.newHashSet();
       localAdditions = ArrayListMultimap.create();
 
-      // TODO(buqian): track the size of each multimap entry
       cache.put(namespace, address, this, 1);
 
       return commitBuilder.buildPartial();
