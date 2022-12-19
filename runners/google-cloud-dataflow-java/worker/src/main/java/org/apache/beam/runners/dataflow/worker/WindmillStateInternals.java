@@ -27,6 +27,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -1902,13 +1903,13 @@ class WindmillStateInternals<K> implements StateInternals {
 
     private MultimapIterables<K, V> mergedCachedEntries() {
       MultimapIterables<K, V> result = new MultimapIterables<>();
-      for (Object structuralKey : localAdditions.keySet()) {
-        K key = structuralKeyMapping.get(structuralKey);
-        result.extendWith(key, localAdditions.get(structuralKey));
+      for (Entry<Object, Collection<V>> entry : localAdditions.asMap().entrySet()) {
+        K key = structuralKeyMapping.get(entry.getKey());
+        result.extendWith(key, entry.getValue());
       }
-      for (Object structuralKey : cachedEntries.keySet()) {
-        K key = structuralKeyMapping.get(structuralKey);
-        result.extendWith(key, cachedEntries.get(structuralKey));
+      for (Entry<Object, Iterable<V>> entry : cachedEntries.entrySet()) {
+        K key = structuralKeyMapping.get(entry.getKey());
+        result.extendWith(key, entry.getValue());
       }
       return result;
     }

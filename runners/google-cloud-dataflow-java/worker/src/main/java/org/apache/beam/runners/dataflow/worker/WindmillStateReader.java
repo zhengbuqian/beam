@@ -531,9 +531,8 @@ class WindmillStateReader {
                 Collectors.groupingBy(
                     StateTag::getStateFamily, Collectors.groupingBy(StateTag::getTag)));
 
-    for (String stateFamily : groupedTags.keySet()) {
-      for (ByteString tag : groupedTags.get(stateFamily).keySet()) {
-        List<StateTag<?>> tags = groupedTags.get(stateFamily).get(tag);
+    for (Map<ByteString, List<StateTag<?>>> familyTags : groupedTags.values()) {
+      for (List<StateTag<?>> tags : familyTags.values()) {
         StateTag<?> first = tags.remove(0);
         toFetch.add(first);
 
@@ -700,10 +699,12 @@ class WindmillStateReader {
               .collect(
                   Collectors.groupingBy(
                       StateTag::getStateFamily, Collectors.groupingBy(StateTag::getTag)));
-
-      for (String stateFamily : multimapTags.keySet()) {
-        for (ByteString tag : multimapTags.get(stateFamily).keySet()) {
-          List<StateTag<?>> stateTags = multimapTags.get(stateFamily).get(tag);
+      for (Map.Entry<String, Map<ByteString, List<StateTag<?>>>> entry : multimapTags.entrySet()) {
+        String stateFamily = entry.getKey();
+        Map<ByteString, List<StateTag<?>>> familyTags = multimapTags.get(stateFamily);
+        for (Map.Entry<ByteString, List<StateTag<?>>> tagEntry : familyTags.entrySet()) {
+          ByteString tag = tagEntry.getKey();
+          List<StateTag<?>> stateTags = tagEntry.getValue();
           Windmill.TagMultimapFetchRequest.Builder multimapFetchBuilder =
               keyedDataBuilder
                   .addMultimapsToFetchBuilder()
